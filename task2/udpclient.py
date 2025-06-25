@@ -25,8 +25,7 @@ FIN = 4
 # ======================== 客户端配置参数 ========================
 TOTAL_PACKETS_TO_SEND = 30  #一共要发送的数量
 WINDOW_SIZE = 400  
-MIN_DATA_SIZE = 40 
-MAX_DATA_SIZE = 80 
+PACKET_SIZE = 80
 TIMEOUT = 0.5  # 超时时间0.5秒
 
 # ======================== 全局状态变量 ========================
@@ -40,7 +39,6 @@ lock = threading.Lock()     # 线程同步锁
 #     'packet': 完整数据包字节
 #     'send_time': 发送时间戳
 #     'packet_idx': 包序号
-#     'data_end': 数据结束位置
 packets_unacked = {}
 
 RTT_OK = []                 # 存储成功的往返时间样本
@@ -59,34 +57,28 @@ def unpack_header(packet):#解包首部
         return None, None, None, None, None
 
 def handle_acks(client_socket):#单独在一个线程,用于接收服务器的ACK
-    global send_start, RTT_OK, receiver_active, acked_packet_num
+    global send_start, RTT_OK, receiver_active, acked_packet_num, next_seq_num
     
     while receiver_active:
         try:
             response, _ = client_socket.recvfrom(1024)
             _, res_ack, res_flags, _, _ = unpack_header(response) #解包
             
-            # 如果是FIN-ACK，不处理时间戳
-            if res_flags and res_flags & FIN and res_flags & ACK:
-                continue
-            
             if res_flags and res_flags & ACK:
-                server_time_data = response[HEADER_SIZE:HEADER_SIZE + 8]
-                server_time = struct.unpack('!d', server_time_data)[0]
-
                 with lock:#线程安全锁
-                    if res_ack > send_start:
-                        new_acked_seqs = [seq for seq in sorted(packets_unacked.keys()) if seq < res_ack]
-                        
-                        for seq in new_acked_seqs: 
-                            value = packets_unacked.pop(seq)
-                            RTT = (time.time() - value['send_time']) * 1000
-                            RTT_OK.append(RTT)
-                            acked_packet_num += 1
-                            print(f"第{value['packet_idx']}个 (第{seq}~{value['data_end']-1}字节) server端已经收到, RTT是{RTT:.2f} ms")
-                                 
+                    # GBN协议：任何ACK都表示之前所有包都已收到
+                    if res_ack > send_start:   
+                        # 移除所有已确认的包
+                        for seq in list(packets_unacked.keys()):
+                            if send_start <= seq < res_ack:
+                                value = packets_unacked.pop(seq)
+                                RTT = (time.time() - value['send_time']) * 1000
+                                RTT_OK.append(RTT)
+                                acked_packet_num += 1
+                                print(f"第{value['packet_idx']}个 (Seq={seq}) server端已经收到, RTT是{RTT:.2f} ms")
+                                
                         send_start = res_ack
-
+                        #next_seq_num = send_start
                     if acked_packet_num >= TOTAL_PACKETS_TO_SEND:
                         all_packets_acked.set()
 
@@ -137,11 +129,10 @@ def main(server_ip, server_port):
 
     # ========== 第二步：数据传输阶段 ==========
     # 生成测试数据包（每个包包含序号和随机填充）
-    size = random.randint(MIN_DATA_SIZE, MAX_DATA_SIZE)
     data_load = []
     for i in range(TOTAL_PACKETS_TO_SEND):
         # 内容为序号
-        data_load.append(f"No.{i+1} Packet".ljust(size, '.').encode('utf-8'))
+        data_load.append(f"No.{i+1} Packet".ljust(PACKET_SIZE, '.').encode('utf-8'))
 
     # 开始接收 ACK
     receiver_thread = threading.Thread(
@@ -157,11 +148,10 @@ def main(server_ip, server_port):
         while not all_packets_acked.is_set():
             with lock:  # 获取线程锁
                 # 发送窗口内的新数据包(没满且有未发送的)
-                while next_seq_num < send_start + WINDOW_SIZE and cur_packet_idx < TOTAL_PACKETS_TO_SEND:
+                while send_start<= next_seq_num and next_seq_num + PACKET_SIZE <= send_start + WINDOW_SIZE and cur_packet_idx < TOTAL_PACKETS_TO_SEND:
                     data = data_load[cur_packet_idx]
-                    data_len = len(data)
                     
-                    packet_header = pack_header(next_seq_num, 0, flags=0, data_len=data_len)
+                    packet_header = pack_header(next_seq_num, 0, flags=0, data_len=PACKET_SIZE)
                     packet = packet_header + data
                     
                     # 发送并记录包信息
@@ -169,26 +159,27 @@ def main(server_ip, server_port):
                         'packet': packet,
                         'send_time': time.time(),
                         'packet_idx': cur_packet_idx + 1,
-                        'data_end': next_seq_num + data_len
                     }
                     client_socket.sendto(packet, server_addr)
                     packets_unacked[next_seq_num] = packet_info
                     total_send_num += 1
 
-                    print(f"第{packet_info['packet_idx']}个 (第{next_seq_num}~{packet_info['data_end']-1}字节) client端已经发送")
+                    print(f"第{packet_info['packet_idx']}个 (Seq={next_seq_num}) client端已经发送")
 
-                    next_seq_num += data_len
+                    next_seq_num += PACKET_SIZE
                     cur_packet_idx += 1
 
                 # 检查超时包并重传
                 current_time = time.time()
-                for seq, info in list(packets_unacked.items()):#packets_unacked.items()：返回 (seq_num, packet_info) 的键值对
-                    if current_time - info['send_time'] > TIMEOUT:
-                        print(f"重传第{info['packet_idx']}个 (第{seq}~{info['data_end']-1}字节) 数据包")
-                        info['send_time'] = current_time
-                        client_socket.sendto(info['packet'], server_addr)
-                        total_send_num += 1
-
+                if packets_unacked and current_time - min([info['send_time'] for info in packets_unacked.values()]) > TIMEOUT:
+                   print(f"超时, 重传窗口内所有包 (Seq={send_start}~{next_seq_num - 1})")
+                   for seq, info in list(packets_unacked.items()):
+                       if seq >= send_start and seq + PACKET_SIZE <= send_start + WINDOW_SIZE:
+                           info['send_time'] = current_time
+                           client_socket.sendto(info['packet'], server_addr)
+                           total_send_num += 1
+                           print(f"重传第{info['packet_idx']}个 (Seq={seq}) 数据包")
+                    
     finally:
         # ========== 第三步：连接关闭（四次挥手） ==========
         # (第一次挥手)
@@ -201,7 +192,7 @@ def main(server_ip, server_port):
             client_socket.settimeout(5.0)
             FIN_ACK_res, _ = client_socket.recvfrom(1024)
             _, res_ack, res_flags, _, _ = unpack_header(FIN_ACK_res)
-            if res_flags == FIN | ACK and res_ack == next_seq_num + 1:
+            if res_flags == FIN | ACK:
                 print(f"成功收到 FIN-ACK (Ack={res_ack}), 连接正常关闭")
                  
                 # (第四次挥手) 客户端发送ACK确认
@@ -210,7 +201,7 @@ def main(server_ip, server_port):
                 print(f"已成功向 {server_addr} 发送 ACK (Ack={res_ack})")
         
                 # 等待一段时间确保服务器收到ACK
-                #time.sleep(0.5)
+                time.sleep(0.1)
                 
         except socket.timeout:
             print("警告: 等待服务器 FIN-ACK 超时")

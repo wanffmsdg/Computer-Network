@@ -5,8 +5,8 @@ HOST = '127.0.0.1'    # 监听IP（默认本地环回）
 PORT = 11111          # 监听端口
 PACKET_LOSS_RATE = 0.3 # 模拟丢包率 (0.0-1.0)
 
-# 滑动窗口参数
-WINDOW_SIZE = 400        # 窗口大小（字节）
-MIN_DATA_SIZE = 40       # 最小数据包大小
-MAX_DATA_SIZE = 80       # 最大数据包大小
-TIMEOUT = 0.5            # 超时重传时间（秒）
+# ======================== 客户端配置参数 ========================
+TOTAL_PACKETS_TO_SEND = 30  #一共要发送的数量
+WINDOW_SIZE = 400  
+PACKET_SIZE = 80
+TIMEOUT = 0.5  # 超时时间0.5秒

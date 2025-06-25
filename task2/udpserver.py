@@ -23,6 +23,7 @@ FIN = 4
 HOST = '127.0.0.1'
 PORT = 11111
 PACKET_LOSS_RATE = 0.3  # 30%的丢包率
+PACKET_SIZE = 80
 
 def pack_header(seq_num, ack_num, flags=0, data_len=0):#用于打包首部
     return struct.pack(HEADER_FORMAT, seq_num, ack_num, flags, data_len, b'\x00')
@@ -43,9 +44,6 @@ def main():
     client_addr = None
     is_connected = False
     expected_seq_num = 0
-    
-    # 缓冲区:处理乱序包(键:seq, 值:数据长度)
-    disorder_buffer = {}
 
     while True:
         try:
@@ -60,7 +58,7 @@ def main():
                         print(f"随机丢弃了来自 {addr} 的 Seq={header_info[0]} 包")
                         continue
             
-            seq_num, ack_num, flags, data_len, _ = unpack_header(packet)
+            seq_num, ack_num, flags, _, _ = unpack_header(packet)
 
             # 1. 连接建立(第一次握手)
             if not is_connected:
@@ -103,38 +101,25 @@ def main():
                         print("警告: 等待客户端ACK超时")
                     
                     # 刷新状态变量
+                    print(f"The connection with {client_addr} has been dropped...")
                     client_addr = None
                     is_connected = False
                     expected_seq_num = 0
-                    disorder_buffer.clear()
-                    print(f"The connection with {client_addr} has been dropped...")
                     continue
 
-                # 收到了想要的包
+                # # 收到了想要的包
                 if seq_num == expected_seq_num:
-                    expected_seq_num += data_len
-                    ''' 缓存区中可能有后面的包(比如当前的被丢包后再发送就会晚到),
-                        所以顺便检查了'''
-                    while expected_seq_num in disorder_buffer:
-                        print(f"从缓冲区中取出 Seq={expected_seq_num} 的包并处理")
-                        buffered_data_len = disorder_buffer.pop(expected_seq_num)
-                        expected_seq_num += buffered_data_len
-
-                # 如果后面的包先到了
-                elif seq_num > expected_seq_num:
-                    if seq_num not in disorder_buffer:
-                        disorder_buffer[seq_num] = data_len
-                        print(f"有一个后面的包 (Seq={seq_num}) 存入了缓冲区")
-                    else:
-                        print(f"Seq={seq_num}的包多次到达, 已忽略")
-
-                #累计确认
-                server_time = time.time()
-                ack_payload = struct.pack('!d', server_time) # 将时间戳打包为8字节double
-                ack_header = pack_header(0, expected_seq_num, flags=ACK, data_len=len(ack_payload))
-                ack_packet = ack_header + ack_payload
-                server_socket.sendto(ack_packet, client_addr)
-                print(f"成功向 {client_addr} 发送累计确认 (Ack={expected_seq_num})")
+                    expected_seq_num += PACKET_SIZE
+                    print(f'成功接收按序包 (Seq={seq_num})')
+                    #累计确认
+                    server_time = time.time()
+                    ack_payload = struct.pack('!d', server_time) # 将时间戳打包为8字节double
+                    ack_header = pack_header(0, expected_seq_num, flags=ACK, data_len=len(ack_payload))
+                    ack_packet = ack_header + ack_payload
+                    server_socket.sendto(ack_packet, client_addr)
+                    print(f"成功向 {client_addr} 发送累计确认 (Ack={expected_seq_num})")                   
+                else:
+                    print(f'收到乱序包 (Seq={seq_num}), 期望 Seq={expected_seq_num}')
 
         except Exception as e:
             print(f"服务器出错: {e}")
